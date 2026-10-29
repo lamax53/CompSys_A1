@@ -100,7 +100,7 @@ int job_queue_pop(struct job_queue *job_queue, void **data) {
   // Remove a job from the front of the queue
   *data = job_queue->queue[job_queue->front]; 
   job_queue->front = (job_queue->front + 1) % job_queue->capacity; 
-  job_queue->count--; // 
+  job_queue->count--; 
   
   // signal to any waiting threads that there is space available
   pthread_cond_signal(&job_queue->space); 

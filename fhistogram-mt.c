@@ -22,6 +22,59 @@ pthread_mutex_t stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #include "histogram.h"
 
+#define PRINT_INTERVAL 100000
+
+static struct job_queue queue;
+static pthread_mutex_t hist_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int global_histogram[8] = {0};
+static long long bytes_since_last_print = 0;
+
+static void *worker_func(void *arg) {
+  (void)arg;
+
+  while (1) {
+    void *item = NULL;
+    if (job_queue_pop(&queue, &item) != 0) {
+      break;
+    }
+
+    char *path = (char *)item;
+
+    int local_hist[8] = {0};
+    long long local_bytes = 0;
+
+    FILE *f = fopen(path, "rb");
+    if (f != NULL) {
+      unsigned char buffer[4096];
+      size_t bytes_read;
+      while ((bytes_read = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+          update_histogram(local_hist, buffer[i]);
+        }
+        local_bytes += bytes_read;
+      }
+      fclose(f);
+    }
+
+    // Update global state under mutex lock
+    pthread_mutex_lock(&hist_mutex);
+    merge_histogram(local_hist, global_histogram);
+    bytes_since_last_print += local_bytes;
+
+    if (bytes_since_last_print >= PRINT_INTERVAL) {
+      print_histogram(global_histogram);
+      bytes_since_last_print = 0;
+    }
+    pthread_mutex_unlock(&hist_mutex);
+
+    // Free the string allocated via strdup() during traversal
+    free(path);
+  }
+
+  return NULL;
+}
+
 int main(int argc, char * const *argv) {
   if (argc < 2) {
     err(1, "usage: paths...");
@@ -49,7 +102,19 @@ int main(int argc, char * const *argv) {
     paths = &argv[1];
   }
 
-  assert(0); // Initialise the job queue and some worker threads here.
+  // Initialise the job queue and some worker threads here.
+  job_queue_init(&queue, 64);
+
+  pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+  if (!threads) {
+    err(1, "failed to allocate memory for thread handles");
+  }
+
+  for (int i = 0; i < num_threads; i++) {
+    if (pthread_create(&threads[i], NULL, worker_func, NULL) != 0) {
+      err(1, "failed to create worker thread %d", i);
+    }
+  }
 
   // FTS_LOGICAL = follow symbolic links
   // FTS_NOCHDIR = do not change the working directory of the process
@@ -70,7 +135,7 @@ int main(int argc, char * const *argv) {
     case FTS_D:
       break;
     case FTS_F:
-      assert(0); // Process the file p->fts_path, somehow.
+      job_queue_push(&queue, strdup(p->fts_path)); // Process the file p->fts_path, somehow.
       break;
     default:
       break;
@@ -79,7 +144,19 @@ int main(int argc, char * const *argv) {
 
   fts_close(ftsp);
 
-  assert(0); // Shut down the job queue and the worker threads here.
+  // Shut down the job queue and the worker threads here.
+  job_queue_destroy(&queue);
+
+  for (int i = 0; i < num_threads; i++) {
+    pthread_join(threads[i], NULL);
+  }
+  free(threads);
+
+  pthread_mutex_lock(&hist_mutex);
+  print_histogram(global_histogram);
+  pthread_mutex_unlock(&hist_mutex);
+
+  pthread_mutex_destroy(&hist_mutex);
 
   move_lines(9);
 
